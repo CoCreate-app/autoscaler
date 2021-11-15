@@ -1,0 +1,266 @@
+# This is a workflow that is manually triggered to deploy supported components other than applications
+
+name: Manual Deploy Workflow
+
+# Controls when the action will run. Workflow runs when manually triggered using the UI
+# or API.
+on:
+  workflow_dispatch:
+    # Inputs the workflow accepts.
+    inputs:
+      target_env: 
+        description: 'Target github environment to use'
+        default: 'dev_env'
+        required: true
+      deploy_components:
+        description: |
+          Components to deploy separated by commas.
+          Support "nodeautoscaler", "lb", "keepalived".
+        default: 'nodeautoscaler,lb,keepalived'
+        required: true
+      dry_run:
+        description: |
+          If set to 'yes', run all deployment in dry-run mode.
+          Otherwise, set to 'no'.
+        default: 'yes'
+        required: true
+      kubectl_version:
+        description: 'Version of kubectl to be installed'
+        default: '1.19.9'
+        required: true
+      # Use following command to generate base64 code:
+      #   cat <<EOF | base64 | tr -d '\n' | xargs echo
+      #   <your_autoscalegroups_yaml>
+      #   EOF
+      auto_scale_groups:
+        description: |
+          The auto scale groups defined in yaml to apply given as a string from base64 encoding.
+          See the comments in .github/workflows/manual.yml for how to get a base64 encoded yaml.
+          If this is set to empty, the nodeautoscaler/deploy/auto-scale-groups-configmap.yml in repo will be used.
+        default: ''
+        required: false
+      all_peers_ip:
+        description: |
+          The private IPs of all nodes running keepalived talked to AWS separated by comma.
+          For example, "10.0.0.1,10.0.0.2"
+          This must be non-empty if keepalived is deployed.
+        default: ''
+        required: false
+      eip_alloc_id:
+        description: |
+          The allocation ID of elastic IP in AWS used as the virtual IP in keepalived.
+          If this is set to empty, the secret EIP_ALLOC_ID in the specified environment
+          input by target_env will be used.
+        default: ''
+        required: false
+      aws_default_region:
+        description: |
+          The default AWS region connected by keepalived. This must match the granted permission
+          to AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY stored in environement secrets.
+        default: 'us-east-1'
+        required: true
+      primary_nic_name:
+        description: |
+          The primary NIC on the host that will be assigned VIP by keepalived.
+        default: 'ens5'
+        required: true
+      rancher_url:
+        description: |
+          The URL of target rancher when node auto scaler uses Rancher as backend node provisioner.
+          If set to empty, the value of secret RANCHER_URL in the input env
+          set by target_env will be used
+        default: ''
+        required: false
+
+# A workflow run is made up of one or more jobs that can run sequentially or in parallel
+jobs:
+  # Deploy components
+  deploy:
+    # Use dev environment
+    environment: ${{ github.event.inputs.target_env }}
+    # The type of runner that the job will run on
+    runs-on: ubuntu-latest
+    # Environment variables
+    env:
+      DRY_RUN: ${{ github.event.inputs.dry_run }}
+    # Steps represent a sequence of tasks that will be executed as part of the job
+    steps:
+    - name: Setup kubectl with empty input kubeconfig
+      uses: ThomasKliszowski/setup-kubectl@v1
+      with:
+        # Base64 encoded kube config
+        kube-config: ${{ secrets.KUBE_CONFIG }}
+        # Kube version used to download kubectl executable, defaults to latest
+        kube-version: ${{ github.event.inputs.kubectl_version }}
+    # Check installed kubectl
+    - name: Check installed kubectl
+      run: |
+        kubectl version
+    # Check configured kubeconfig
+    - name: Check and persist kubeconfig
+      id: step_kubeconfig
+      run: |
+        kubectl config view
+    # Checkout local repo
+    - name: Checkout local repo
+      uses: actions/checkout@v2.3.4
+    # Replace ConfigMap of auto scale groups with input value
+    - name: Generate configmap with auto scale groups
+      env:
+        AUTO_SCALE_GROUPS: ${{ github.event.inputs.auto_scale_groups }}
+      if: ${{ env.AUTO_SCALE_GROUPS != '' && contains(github.event.inputs.deploy_components, 'nodeautoscaler') }}
+      run: |
+        echo
+        echo "********** Got input auto scale groups ***********"
+        echo
+        echo ${AUTO_SCALE_GROUPS} | base64 -d | tee autoscalegroups.yaml
+        echo
+        echo "********** Generate configmap ************"
+        echo
+        kubectl create cm auto-scale-groups -n node-auto-scaler --from-file=autoscalegroups.yaml \
+           --dry-run=client -o yaml | tee ${GITHUB_WORKSPACE}/nodeautoscaler/deploy/auto-scale-groups-configmap.yaml
+    # Apply configmap in the repo
+    - name: Deploy configmap of auto scale groups
+      if: ${{ contains(github.event.inputs.deploy_components, 'nodeautoscaler') }}
+      run: |
+        if [ "$DRY_RUN" == 'yes' ]
+        then
+          echo
+          echo "********** Deploy configmap in dry-run mode ************"
+          echo
+          kubectl replace -f ${GITHUB_WORKSPACE}/nodeautoscaler/deploy/auto-scale-groups-configmap.yaml \
+            --dry-run=client -o yaml
+        else
+          echo
+          echo "********** Deploy configmap ************"
+          echo
+          kubectl replace -f ${GITHUB_WORKSPACE}/nodeautoscaler/deploy/auto-scale-groups-configmap.yaml -o yaml
+        fi
+    - name: Deploy rancher secret
+      if: ${{ contains(github.event.inputs.deploy_components, 'nodeautoscaler') }}
+      env:
+        RANCHER_URL: ${{ github.event.inputs.rancher_url }}
+        RANCHER_TOKEN: ${{ secrets.RANCHER_TOKEN }}
+        ENV_RANCHER_URL: ${{ secrets.RANCHER_URL }}
+      run: |
+        if [ "$RANCHER_URL" == '' ]
+        then
+          echo
+          echo "********** No rancher_url input, use environment secret *************"
+          echo
+          RANCHER_URL=${ENV_RANCHER_URL}
+        fi
+        ENCODE_URL=$(echo ${RANCHER_URL} | base64 | tr -d '\n')
+        sed -i "s/{{ RANCHER_URL }}/${ENCODE_URL}/g" ${GITHUB_WORKSPACE}/nodeautoscaler/deploy/rancher-secret.yaml
+        ENCODE_TOKEN=$(echo ${RANCHER_TOKEN} | base64 | tr -d '\n')
+        sed -i "s/{{ RANCHER_TOKEN }}/${ENCODE_TOKEN}/g" ${GITHUB_WORKSPACE}/nodeautoscaler/deploy/rancher-secret.yaml
+        if [ "$DRY_RUN" == 'yes' ]
+        then
+          echo
+          echo "********** Deploy secret in dry-run mode ************"
+          echo
+          kubectl replace -f ${GITHUB_WORKSPACE}/nodeautoscaler/deploy/rancher-secret.yaml \
+            --dry-run=client
+        else
+          echo
+          echo "********** Deploy secret ************"
+          echo
+          kubectl replace -f ${GITHUB_WORKSPACE}/nodeautoscaler/deploy/rancher-secret.yaml
+        fi
+    - name: Deploy node auto scaler
+      if: ${{ contains(github.event.inputs.deploy_components, 'nodeautoscaler') }}
+      run: |
+        if [ "$DRY_RUN" == 'yes' ]
+        then
+          echo
+          echo "********** Deploy node auto scaler in dry-run mode ************"
+          echo
+          kubectl replace -f ${GITHUB_WORKSPACE}/nodeautoscaler/deploy/node-auto-scaler-manifests.yaml \
+            --dry-run=client -o yaml
+        else
+          echo
+          echo "********** Deploy node auto scaler ************"
+          echo
+          kubectl apply -f ${GITHUB_WORKSPACE}/nodeautoscaler/deploy/node-auto-scaler-manifests.yaml -o yaml
+        fi
+    - name: Deploy aws secret
+      env:
+        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      if: ${{ contains(github.event.inputs.deploy_components, 'keepalived') }}
+      run: |
+        ENCODE_ID=$(echo ${AWS_ACCESS_KEY_ID} | base64 | tr -d '\n')
+        sed -i "s/{{ AWS_ACCESS_KEY_ID }}/${ENCODE_ID}/g" ${GITHUB_WORKSPACE}/manifests/aws-secret.yaml
+        ENCODE_KEY=$(echo ${AWS_SECRET_ACCESS_KEY} | base64 | tr -d '\n')
+        sed -i "s/{{ AWS_SECRET_ACCESS_KEY }}/${ENCODE_KEY}/g" ${GITHUB_WORKSPACE}/manifests/aws-secret.yaml
+        if [ "$DRY_RUN" == 'yes' ]
+        then
+          echo
+          echo "********** Deploy secret in dry-run mode ************"
+          echo
+          kubectl replace -f ${GITHUB_WORKSPACE}/manifests/aws-secret.yaml --dry-run=client
+        else
+          echo
+          echo "********** Deploy secret ************"
+          echo
+          kubectl replace -f ${GITHUB_WORKSPACE}/manifests/aws-secret.yaml
+        fi
+    - name: Deploy keepalived
+      env:
+        ALL_PPERS_IP: ${{ github.event.inputs.all_peers_ip }}
+        EIP_ALLOC_ID: ${{ github.event.inputs.eip_alloc_id }}
+        AWS_DEFAULT_REGION: ${{ github.event.inputs.aws_default_region }}
+        PRIMARY_NIC_NAME: ${{ github.event.inputs.primary_nic_name }}
+        ENV_EIP_ALLOC_ID: ${{ secrets.EIP_ALLOC_ID }}
+      if: ${{ contains(github.event.inputs.deploy_components, 'keepalived') }}
+      run: |
+        set -e
+        if [ "$ALL_PPERS_IP" == '' ]
+        then
+          echo
+          echo "*********** ALL_PPERS_IP can not be empty **********"
+          exit 1
+        fi
+        echo
+        echo "*********** All peers IP: ${ALL_PPERS_IP} **********"
+        if [ "$EIP_ALLOC_ID" != '' ]
+        then
+          echo "*********** Elastic IP alloc ID: ${EIP_ALLOC_ID} **********"
+        else
+          echo "*********** No input elastic IP alloc ID, use environment secret **********"
+          EIP_ALLOC_ID=${ENV_EIP_ALLOC_ID}
+        fi
+        echo "*********** AWS default region: ${AWS_DEFAULT_REGION} **********"
+        echo "*********** Primary NIC: ${PRIMARY_NIC_NAME} **********"
+        echo
+        sed -i "s/{{ ALL_PPERS_IP }}/${ALL_PPERS_IP}/g" ${GITHUB_WORKSPACE}/manifests/aws-keepalived-manifests.yaml
+        sed -i "s/{{ EIP_ALLOC_ID }}/${EIP_ALLOC_ID}/g" ${GITHUB_WORKSPACE}/manifests/aws-keepalived-manifests.yaml
+        sed -i "s/{{ AWS_DEFAULT_REGION }}/${AWS_DEFAULT_REGION}/g" ${GITHUB_WORKSPACE}/manifests/aws-keepalived-manifests.yaml
+        sed -i "s/{{ PRIMARY_NIC_NAME }}/${PRIMARY_NIC_NAME}/g" ${GITHUB_WORKSPACE}/manifests/aws-keepalived-manifests.yaml
+        if [ "$DRY_RUN" == 'yes' ]
+        then
+          echo
+          echo "********** Deploy keepalived in dry-run mode ************"
+          echo
+          kubectl replace -f ${GITHUB_WORKSPACE}/manifests/aws-keepalived-manifests.yaml --dry-run=client -o yaml
+        else
+          echo
+          echo "********** Deploy keepalived ************"
+          echo
+          kubectl replace -f ${GITHUB_WORKSPACE}/manifests/aws-keepalived-manifests.yaml -o yaml
+        fi
+    - name: Deploy LB
+      if: ${{ contains(github.event.inputs.deploy_components, 'lb') }}
+      run: |
+        if [ "$DRY_RUN" == 'yes' ]
+        then
+          echo
+          echo "********** Deploy keepalived in dry-run mode ************"
+          echo
+          kubectl replace -f ${GITHUB_WORKSPACE}/manifests/haproxy-ingress-manifests.yaml --dry-run=client -o yaml
+        else
+          echo
+          echo "********** Deploy keepalived ************"
+          echo
+          kubectl replace -f ${GITHUB_WORKSPACE}/manifests/haproxy-ingress-manifests.yaml -o yaml
+        fi

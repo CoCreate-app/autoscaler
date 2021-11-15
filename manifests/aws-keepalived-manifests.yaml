@@ -1,0 +1,177 @@
+---
+apiVersion: v1
+data:
+  # IPs of all keepalived instances in same cluster
+  all_peers_ip: {{ ALL_PPERS_IP }}
+  # allocation id of elastic IP
+  allocation_id: {{ EIP_ALLOC_ID }}
+  # default targeting aws region
+  aws_default_region: {{ AWS_DEFAULT_REGION }}
+  # primary nic name on the host running keepalived
+  primary_nic: {{ PRIMARY_NIC_NAME }}
+kind: ConfigMap
+metadata:
+  creationTimestamp: null
+  name: aws-keepalived-envs
+  namespace: ingress-haproxy
+---
+apiVersion: v1
+data:
+  check-script.sh: |
+    #!/usr/bin/env bash
+
+    curl -m 2 -s -o /dev/null http://localhost:1042/healthz
+  keepalived.conf: |
+    global_defs {
+        script_user root
+        enable_script_security
+        router_id {{ROUTER_ID}}
+        vrrp_garp_master_delay 1
+        vrrp_garp_master_refresh 30
+    }
+    vrrp_script chk_port {
+        script /etc/keepalived/check-script.sh
+        timeout 3
+        interval 2
+        fall 2
+        rise 2
+    }
+    vrrp_instance k8s-vips {
+        state BACKUP
+        interface {{PRIMARY_NIC}}
+        virtual_router_id 22
+        priority {{NODE_PRIORITY}}
+        advert_int 1
+        nopreempt
+        dont_track_primary
+        track_script {
+            chk_port
+        }
+        unicast_src_ip {{LOCAL_IP}}
+        unicast_peer {
+            {{PEERS_IP}}
+        }
+        authentication {
+            auth_type PASS
+            auth_pass d0ck3r
+        }
+        notify_master /etc/keepalived/notify-master-script.sh
+        notify_backup /etc/keepalived/notify-backup-script.sh
+        notify_fault /etc/keepalived/notify-backup-script.sh
+    }
+kind: ConfigMap
+metadata:
+  creationTimestamp: null
+  name: keepalived-config
+  namespace: ingress-haproxy
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: aws-keepalived
+  namespace: ingress-haproxy
+  labels:
+    app: aws-keepalived
+spec:
+  minReadySeconds: 0
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: aws-keepalived
+  template:
+    metadata:
+      labels:
+        app: aws-keepalived
+    spec:
+      terminationGracePeriodSeconds: 300
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      priorityClassName: system-cluster-critical
+      containers:
+        - name: aws-keepalived
+          image: "jiuchen1986/aws-keepalived:2.1.29"
+          imagePullPolicy: Always
+          env:
+          # aws access key id
+          - name: AWS_ACCESS_KEY_ID
+            valueFrom:
+              secretKeyRef:
+                name: aws-keepalived-keys
+                key: AWS_ACCESS_KEY_ID
+          # aws secret access key
+          - name: AWS_SECRET_ACCESS_KEY
+            valueFrom:
+              secretKeyRef:
+                name: aws-keepalived-keys
+                key: AWS_SECRET_ACCESS_KEY
+          # default region used when run aws-cli
+          - name: AWS_DEFAULT_REGION
+            valueFrom:
+              configMapKeyRef:
+                name: aws-keepalived-envs
+                key: aws_default_region
+          # directory for state log
+          - name: STATE_LOG_DIR
+            value: "/logs"
+          # IPs of all keepalived instances in same cluster
+          # in format of IP1,IP2,...
+          - name: ALL_PEERS_IP
+            valueFrom:
+              configMapKeyRef:
+                name: aws-keepalived-envs
+                key: all_peers_ip
+          # allocation id of elastic IP
+          - name: ALLOCATION_ID
+            valueFrom:
+              configMapKeyRef:
+                name: aws-keepalived-envs
+                key: allocation_id
+          # IP of current instance
+          - name: LOCAL_IP
+            valueFrom:
+              fieldRef:
+                fieldPath: status.podIP
+          # override default path to keepalived config file
+          # /etc/keepalived/keepalived.conf is not allowed
+          - name: CONFIG_PATH
+            value: /tmp/config/keepalived.conf
+          # override default check script
+          - name: CHECK_SCRIPT_PATH
+            value: /tmp/config/check-script.sh
+          # name of primary nic used for vrrp exchange
+          - name: PRIMARY_NIC
+            valueFrom:
+              configMapKeyRef:
+                name: aws-keepalived-envs
+                key: primary_nic
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+          volumeMounts:
+          - name: state-log-dir
+            mountPath: /logs
+            readOnly: false
+          - name: keepalived-conf
+            mountPath: /tmp/config
+      nodeSelector:
+        nodeType: loadbalancer
+      volumes:
+      - name: state-log-dir
+        hostPath:
+          path: /var/log/aws-keepalived
+          type: DirectoryOrCreate
+      - name: keepalived-conf
+        configMap:
+          name: keepalived-config
+          items:
+          - key: keepalived.conf
+            path: keepalived.conf
+          - key: check-script.sh
+            path: check-script.sh
+            mode: 0755
+---
+

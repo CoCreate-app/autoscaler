@@ -1,0 +1,37 @@
+global_defs {
+    script_user root
+    enable_script_security
+    router_id {{ROUTER_ID}}
+    vrrp_garp_master_delay 1
+    vrrp_garp_master_refresh 30
+}
+vrrp_script chk_port {
+    script /etc/keepalived/check-script.sh
+    timeout 3
+    interval 2
+    fall 2
+    rise 2
+}
+vrrp_instance k8s-vips {
+    state BACKUP
+    interface {{PRIMARY_NIC}}
+    virtual_router_id 22
+    priority {{NODE_PRIORITY}}
+    advert_int 1
+    nopreempt
+    dont_track_primary
+    track_script {
+        chk_port
+    }
+    unicast_src_ip {{LOCAL_IP}}
+    unicast_peer {
+        {{PEERS_IP}}
+    }
+    authentication {
+        auth_type PASS
+        auth_pass d0ck3r
+    }
+    notify_master /etc/keepalived/notify-master-script.sh
+    notify_backup /etc/keepalived/notify-backup-script.sh
+    notify_fault /etc/keepalived/notify-backup-script.sh
+}

@@ -1,0 +1,26 @@
+---
+apiVersion: v1
+data:
+  autoscalegroups.yaml: |
+    autoScaleGroups:
+      - name: loadbalancer
+        scaleUpThreshold: "memory=0.7,cpu=0.7"
+        labelSelector: "nodeType=loadbalancer"
+        metricSource:
+          type: kubernetes
+        provisioner:
+          type: ranchernodepool
+          rancherNodePoolID: "c-bflfq:np-g6jvt"
+      - name: application
+        scaleUpThreshold: "memory=0.7,cpu=0.7"
+        labelSelector: "nodeType=application"
+        metricSource:
+          type: kubernetes
+        provisioner:
+          type: ranchernodepool
+          rancherNodePoolID: "c-bflfq:np-7hb6l"
+kind: ConfigMap
+metadata:
+  creationTimestamp: null
+  name: auto-scale-groups
+---
